@@ -5,3 +5,15 @@ resource "google_service_account" "pipeline_test" {
   display_name = "Pipeline test SA"
   description  = "Created by the Terraform pipeline test"
 }
+
+resource "google_service_account" "second" {
+  account_id   = "pipeline-test-sa-2"
+  display_name = "Pipeline test SA 2"
+}
+
+resource "google_storage_bucket" "second" {
+  name                        = "ipam-conn-pn20482-pipeline-test-2"
+  location                    = "asia-south1"
+  uniform_bucket_level_access = true
+  force_destroy               = true
+}
