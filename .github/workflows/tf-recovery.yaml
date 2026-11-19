@@ -1,0 +1,224 @@
+name: Terraform recovery and drift
+
+# TEST SETUP for project ipam-conn-pn20482. Hardcoded settings, no Wiz.
+#
+#   Run workflow (workflow_dispatch) - RECOVERY
+#     folder : one Terraform root (e.g. workspace/test/service-account)
+#     Fresh plan from main -> approval -> apply.
+#
+#   Schedule - DRIFT CHECK
+#     Plans every root from main, never applies, fails the run on drift.
+#     TEST: runs every 15 minutes. For real use: "30 0 * * 1-5" (06:00 IST weekdays).
+
+on:
+  workflow_dispatch:
+    inputs:
+      folder:
+        description: "Terraform root to re-plan and apply (e.g. workspace/test/service-account)"
+        required: true
+        type: string
+  schedule:
+    - cron: "*/15 * * * *"   # TEST: every 15 min. Real: "30 0 * * 1-5"
+
+concurrency:
+  group: tf-recovery-${{ github.event_name == 'schedule' && 'drift' || inputs.folder }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_ROOTS_DIR: "workspace"
+  SCRIPTS: ${{ github.workspace }}/.github/scripts
+  TF_VERSION: "1.12.2"
+  GCP_WIF_PROVIDER: "projects/839161155994/locations/global/workloadIdentityPools/github-pool/providers/github-provider"
+  GCP_TF_PLAN_SA: "tf-plan@ipam-conn-pn20482.iam.gserviceaccount.com"
+  GCP_TF_APPLY_SA: "tf-apply@ipam-conn-pn20482.iam.gserviceaccount.com"
+  # TEST ONLY: in a real repo this must be a repository secret.
+  TF_PLAN_PASSPHRASE: "pipeline-test-only-passphrase"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Select roots: the given folder (recovery) or every root (drift)
+  # ---------------------------------------------------------------------------
+  select:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.select.outputs.matrix }}
+    steps:
+      - name: Require main
+        run: '[ "$GITHUB_REF" = "refs/heads/main" ] || { echo "::error::Run this workflow from the main branch."; exit 1; }'
+
+      - name: Recovery applies one folder at a time
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          FOLDER: ${{ inputs.folder }}
+        run: '[ "$FOLDER" != "all" ] || { echo "::error::Recovery applies one folder at a time, not all."; exit 1; }'
+
+      - uses: actions/checkout@v6
+
+      - name: Lint pipeline scripts
+        run: shellcheck .github/scripts/*.sh
+
+      - id: select
+        env:
+          TF_SELECT: ${{ github.event_name == 'schedule' && 'all' || inputs.folder }}
+        run: bash "$SCRIPTS/detect-changes.sh"
+
+  # ---------------------------------------------------------------------------
+  # 2. Fresh plan from main
+  # ---------------------------------------------------------------------------
+  plan:
+    name: plan (${{ matrix.dir }})
+    needs: select
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.select.outputs.matrix) }}
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        working-directory: ${{ matrix.dir }}
+    outputs:
+      status: ${{ steps.status.outputs.status }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Authenticate to GCP (plan SA)
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ env.GCP_WIF_PROVIDER }}
+          service_account: ${{ env.GCP_TF_PLAN_SA }}
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform init
+        id: init
+        run: terraform init -input=false
+
+      - name: terraform fmt
+        id: fmt
+        run: terraform fmt -check -recursive -diff
+
+      - name: terraform validate
+        id: validate
+        run: terraform validate -no-color
+
+      - name: terraform plan
+        id: plan
+        run: bash "$SCRIPTS/tf-plan.sh"
+
+      # Recovery: shows the plan to approvers. Drift: fails the run on any change.
+      - name: Report plan
+        env:
+          DIR: ${{ matrix.dir }}
+          PLAN_EXIT: ${{ steps.plan.outputs.exit_code }}
+          FAIL_ON_DRIFT: ${{ github.event_name == 'schedule' }}
+        run: bash "$SCRIPTS/plan-report.sh"
+
+      # --- Recovery only ----------------------------------------------------------
+      - name: Define folder status
+        id: status
+        if: always() && github.event_name == 'workflow_dispatch'
+        env:
+          INIT_OUT: ${{ steps.init.outcome }}
+          FMT_OUT: ${{ steps.fmt.outcome }}
+          VAL_OUT: ${{ steps.validate.outcome }}
+          PLAN_EXIT: ${{ steps.plan.outputs.exit_code }}
+          WIZ_EXIT: "0"   # Wiz skipped in this test
+          STATUS_FILE: ${{ matrix.name }}.txt
+        run: bash "$SCRIPTS/folder-status.sh"
+
+      - name: Encrypt sensitive plan files
+        if: steps.status.outputs.status == 'ready'
+        env:
+          PASSPHRASE: ${{ env.TF_PLAN_PASSPHRASE }}
+        run: bash "$SCRIPTS/plan-crypt.sh" encrypt
+
+      - name: Upload plan files
+        if: steps.status.outputs.status == 'ready'
+        uses: actions/upload-artifact@v7
+        with:
+          name: tf-recovery-${{ matrix.name }}
+          path: |
+            ${{ matrix.dir }}/tfplan.gpg
+            ${{ matrix.dir }}/plan.json.gpg
+            ${{ matrix.dir }}/plan.txt
+            ${{ matrix.dir }}/.terraform.lock.hcl
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Enforce status outcome
+        if: always() && github.event_name == 'workflow_dispatch'
+        env:
+          STATUS: ${{ steps.status.outputs.status }}
+        run: '[ "$STATUS" = "ready" ] || [ "$STATUS" = "no_changes" ]'
+
+  # ---------------------------------------------------------------------------
+  # 3. Approval (recovery only, when there is something to apply)
+  # ---------------------------------------------------------------------------
+  approval:
+    needs: plan
+    if: github.event_name == 'workflow_dispatch' && needs.plan.outputs.status == 'ready'
+    runs-on: ubuntu-24.04
+    environment: tf-plan-approval
+    steps:
+      - run: echo "Recovery plan approved."
+
+  # ---------------------------------------------------------------------------
+  # 4. Apply (recovery only)
+  # ---------------------------------------------------------------------------
+  apply:
+    name: apply (${{ matrix.dir }})
+    needs: [select, plan, approval]
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && needs.approval.result == 'success'
+    runs-on: ubuntu-24.04
+    environment: tf-apply
+    concurrency:
+      group: tf-apply-${{ matrix.name }}
+      cancel-in-progress: false
+    strategy:
+      matrix:
+        include: ${{ fromJSON(needs.select.outputs.matrix) }}
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        working-directory: ${{ matrix.dir }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: tf-recovery-${{ matrix.name }}
+          path: ${{ matrix.dir }}
+
+      - uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ env.GCP_WIF_PROVIDER }}
+          service_account: ${{ env.GCP_TF_APPLY_SA }}
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform init
+        run: terraform init -input=false -lockfile=readonly
+
+      - name: Decrypt sensitive plan files
+        env:
+          PASSPHRASE: ${{ env.TF_PLAN_PASSPHRASE }}
+        run: bash "$SCRIPTS/plan-crypt.sh" decrypt
+
+      - name: terraform apply
+        run: terraform apply -input=false -lock-timeout=10m -no-color tfplan

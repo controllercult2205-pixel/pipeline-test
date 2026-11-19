@@ -1,0 +1,9 @@
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+tfplan
+*.gpg
+plan.json
+plan.txt
+plan-output.txt
